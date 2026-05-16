@@ -28,9 +28,11 @@ const discoveryFile = path.join(pixelAgentsDir, 'standalone-codex-server.json');
 const clients = new Set();
 const agentsByFile = new Map();
 const agentsBySessionId = new Map();
+const knownSessionFiles = new Map();
 const closedFiles = new Set();
 const recentHookEvents = new Map();
 const waitingTimersByAgent = new Map();
+const idleCloseTimersByAgent = new Map();
 let nextAgentId = 1;
 const hookToken =
   process.env.PIXEL_AGENTS_STANDALONE_HOOK_TOKEN || crypto.randomBytes(32).toString('hex');
@@ -181,16 +183,17 @@ function shortFolderName(sessionCwd) {
   return path.basename(sessionCwd);
 }
 
-function addAgent(file, stat, meta, replay = false) {
+function addAgent(file, stat, meta, replay = false, initialOffset = undefined) {
   const sessionId = typeof meta.id === 'string' ? meta.id : path.basename(file, '.jsonl');
   const existingBySession = agentsBySessionId.get(sessionId);
   if (existingBySession) {
     if (!existingBySession.file || existingBySession.file.startsWith('hook:')) {
       existingBySession.file = file;
-      existingBySession.offset = replay ? 0 : stat.size;
+      existingBySession.offset = initialOffset ?? (replay ? 0 : stat.size);
       existingBySession.lineBuffer = '';
       existingBySession.decoder = new StringDecoder('utf8');
       agentsByFile.set(file, existingBySession);
+      knownSessionFiles.delete(file);
       closedFiles.delete(file);
     }
     return existingBySession;
@@ -203,7 +206,7 @@ function addAgent(file, stat, meta, replay = false) {
     file,
     cwd: typeof meta.cwd === 'string' ? meta.cwd : undefined,
     sessionId,
-    offset: replay ? 0 : stat.size,
+    offset: initialOffset ?? (replay ? 0 : stat.size),
     lineBuffer: '',
     decoder: new StringDecoder('utf8'),
     activeToolIds: new Set(),
@@ -214,6 +217,7 @@ function addAgent(file, stat, meta, replay = false) {
   };
   agentsByFile.set(file, agent);
   agentsBySessionId.set(agent.sessionId, agent);
+  knownSessionFiles.delete(file);
   broadcast({ type: 'agentCreated', id, folderName: shortFolderName(meta.cwd) });
   return agent;
 }
@@ -284,18 +288,33 @@ function clearWaitingTimer(agent) {
   waitingTimersByAgent.delete(agent.id);
 }
 
+function clearIdleCloseTimer(agent) {
+  const timer = idleCloseTimersByAgent.get(agent.id);
+  if (timer) clearTimeout(timer);
+  idleCloseTimersByAgent.delete(agent.id);
+}
+
 function scheduleWaiting(agent) {
   clearWaitingTimer(agent);
+  clearIdleCloseTimer(agent);
   const timer = setTimeout(() => {
     waitingTimersByAgent.delete(agent.id);
     if (!agentsBySessionId.has(agent.sessionId)) return;
     broadcast({ type: 'agentStatus', id: agent.id, status: 'waiting' });
+    const closeTimer = setTimeout(() => {
+      idleCloseTimersByAgent.delete(agent.id);
+      if (agentsBySessionId.has(agent.sessionId) && agent.activeToolIds.size === 0) {
+        closeAgent(agent);
+      }
+    }, 4000);
+    idleCloseTimersByAgent.set(agent.id, closeTimer);
   }, 1500);
   waitingTimersByAgent.set(agent.id, timer);
 }
 
 function closeAgent(agent) {
   clearWaitingTimer(agent);
+  clearIdleCloseTimer(agent);
   clearAgentTools(agent);
   if (agent.file) {
     closedFiles.add(agent.file);
@@ -370,6 +389,17 @@ function processCodexRecord(agent, record) {
   }
 }
 
+function shouldCreateAgentFromRecord(record) {
+  const payload = record.payload ?? {};
+  const payloadType = payload.type;
+  return (
+    record.type === 'turn_context' ||
+    (record.type === 'event_msg' && payloadType === 'user_message') ||
+    (record.type === 'event_msg' && payloadType === 'agent_message') ||
+    (record.type === 'response_item' && payloadType === 'function_call')
+  );
+}
+
 function readNewLines(agent) {
   if (!agent.file || agent.file.startsWith('hook:')) return;
   try {
@@ -389,6 +419,41 @@ function readNewLines(agent) {
         if (!line.trim()) continue;
         try {
           processCodexRecord(agent, JSON.parse(line));
+        } catch {
+          // Ignore partial or malformed transcript lines.
+        }
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // Session files can disappear during cleanup; keep the UI stable.
+  }
+}
+
+function readPendingLines(candidate) {
+  try {
+    const stat = fs.statSync(candidate.file);
+    if (stat.size <= candidate.offset) return;
+    const fd = fs.openSync(candidate.file, 'r');
+    try {
+      const bytesToRead = Math.min(stat.size - candidate.offset, 256 * 1024);
+      const buf = Buffer.alloc(bytesToRead);
+      const bytesRead = fs.readSync(fd, buf, 0, bytesToRead, candidate.offset);
+      if (bytesRead === 0) return;
+      candidate.offset += bytesRead;
+      const text = candidate.lineBuffer + candidate.decoder.write(buf.subarray(0, bytesRead));
+      const lines = text.split('\n');
+      candidate.lineBuffer = lines.pop() ?? '';
+      let agent = null;
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const record = JSON.parse(line);
+          if (!agent && shouldCreateAgentFromRecord(record)) {
+            agent = addAgent(candidate.file, stat, candidate.meta, false, candidate.offset);
+          }
+          if (agent) processCodexRecord(agent, record);
         } catch {
           // Ignore partial or malformed transcript lines.
         }
@@ -548,7 +613,21 @@ function processCodexHookEvent(event) {
 
 function scanCodexSessions() {
   for (const { file, stat, meta } of discoverSessionFiles()) {
-    addAgent(file, stat, meta);
+    if (closedFiles.has(file) || agentsByFile.has(file)) continue;
+    const known = knownSessionFiles.get(file);
+    if (!known) {
+      knownSessionFiles.set(file, {
+        file,
+        offset: stat.size,
+        meta,
+        lineBuffer: '',
+        decoder: new StringDecoder('utf8'),
+      });
+      continue;
+    }
+    if (stat.size > known.offset) {
+      readPendingLines(known);
+    }
   }
   for (const agent of agentsByFile.values()) {
     readNewLines(agent);

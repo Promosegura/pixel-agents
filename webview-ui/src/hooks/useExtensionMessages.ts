@@ -207,6 +207,32 @@ export function useExtensionMessages(
         os.removeAgent(id);
       } else if (msg.type === 'existingAgents') {
         const incoming = msg.agents as number[];
+        const incomingIds = new Set(incoming);
+        setAgents((prev) => {
+          for (const id of prev) {
+            if (!incomingIds.has(id)) {
+              os.removeAllSubagents(id);
+              os.removeAgent(id);
+            }
+          }
+          return incoming.slice().sort((a, b) => a - b);
+        });
+        setAgentTools((prev) => {
+          const next = { ...prev };
+          for (const id of Object.keys(next)) {
+            if (!incomingIds.has(Number(id))) delete next[Number(id)];
+          }
+          return next;
+        });
+        setAgentStatuses((prev) => {
+          const next = { ...prev };
+          for (const id of Object.keys(next)) {
+            if (!incomingIds.has(Number(id))) delete next[Number(id)];
+          }
+          return next;
+        });
+        setSubagentCharacters((prev) => prev.filter((s) => incomingIds.has(s.parentAgentId)));
+        setSelectedAgent((prev) => (prev !== null && !incomingIds.has(prev) ? null : prev));
         const meta = (msg.agentMeta || {}) as Record<
           number,
           { palette?: number; hueShift?: number; seatId?: string }
@@ -227,16 +253,6 @@ export function useExtensionMessages(
             });
           }
         }
-        setAgents((prev) => {
-          const ids = new Set(prev);
-          const merged = [...prev];
-          for (const id of incoming) {
-            if (!ids.has(id)) {
-              merged.push(id);
-            }
-          }
-          return merged.sort((a, b) => a - b);
-        });
       } else if (msg.type === 'agentToolStart') {
         const id = msg.id as number;
         const toolId = msg.toolId as string;
