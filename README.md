@@ -109,6 +109,16 @@ Pixel Agents watches each supported CLI's JSONL transcript files to track what e
 
 See [CODEX.md](CODEX.md) for Codex-specific behavior and current limitations.
 
+### Standalone browser mode
+
+If you use Codex Desktop instead of VS Code, run:
+
+```bash
+npm run standalone
+```
+
+Open the printed local URL in a browser. This mode serves the same Pixel Agents UI and watches recent Codex transcripts in `~/.codex/sessions`.
+
 The webview runs a lightweight game loop with canvas rendering, BFS pathfinding, and a character state machine (idle → walk → type/read). Everything is pixel-perfect at integer zoom levels.
 
 ## Tech Stack

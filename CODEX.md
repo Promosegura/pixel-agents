@@ -35,3 +35,36 @@ npm run build
 ```
 
 Press F5 in VS Code, open the Pixel Agents panel, and click `+ Codex`.
+
+## Standalone Browser Mode
+
+Use this mode when you do not use VS Code and want to watch Codex Desktop or Codex CLI sessions in a normal browser:
+
+```bash
+cd /Users/geandre/trabalho/pessoal/pixel-agents
+npm run standalone
+```
+
+The command builds the UI, starts a local server, and prints a URL like:
+
+```text
+http://127.0.0.1:54321
+```
+
+Open that URL in a browser. The server watches recent Codex transcripts in `~/.codex/sessions` and streams agent/tool events to the browser UI.
+
+If the UI is already built and you only want to start the server:
+
+```bash
+npm run standalone:serve
+```
+
+Optional environment variables:
+
+- `PIXEL_AGENTS_STANDALONE_WINDOW_MINUTES=720` controls how far back the server scans Codex sessions.
+- `PIXEL_AGENTS_STANDALONE_POLL_MS=750` controls the transcript polling interval.
+
+Current standalone limits:
+
+- The browser mode observes existing Codex Desktop/CLI sessions; it does not launch Codex from the browser.
+- Claude Code hooks and Agent Teams remain VS Code-extension functionality for now.

@@ -264,4 +264,30 @@ export function dispatchMockMessages(): void {
   });
 
   console.log('[BrowserMock] Messages dispatched');
+
+  connectStandaloneServer(dispatch);
+}
+
+function connectStandaloneServer(dispatch: (data: unknown) => void): void {
+  if (typeof EventSource === 'undefined') return;
+
+  fetch('/api/standalone')
+    .then((res) => {
+      if (!res.ok) return;
+      const events = new EventSource('/api/events');
+      events.onmessage = (event) => {
+        try {
+          dispatch(JSON.parse(event.data) as unknown);
+        } catch (err) {
+          console.warn('[BrowserMock] Ignoring malformed standalone event', err);
+        }
+      };
+      events.onerror = () => {
+        console.warn('[BrowserMock] Standalone event stream disconnected');
+      };
+      console.log('[BrowserMock] Connected to standalone Codex server');
+    })
+    .catch(() => {
+      // Plain browser mock mode; no standalone backend is running.
+    });
 }
