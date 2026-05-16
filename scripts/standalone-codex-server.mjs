@@ -268,6 +268,42 @@ function getCommandFromInput(input) {
       : '';
 }
 
+function getStringFieldFromInput(input, field) {
+  const normalized = normalizeToolInput(input);
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) return '';
+  const value = normalized[field];
+  return typeof value === 'string' ? value : '';
+}
+
+function trimActivityText(text, maxLength = 90) {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1).trim()}…`;
+}
+
+function extractFunctionalIntent(message) {
+  const normalized = message.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  const objectiveMatch = normalized.match(
+    /(?:objetivo|objective|task|tarefa)\s*:\s*(.+?)(?:\s+(?:faça|entregue|não|do not|return|requirements?)\b|$)/i,
+  );
+  if (objectiveMatch?.[1]) return trimActivityText(objectiveMatch[1]);
+  const sentences = normalized.split(/(?<=[.!?])\s+/);
+  const useful = sentences.find(
+    (sentence) =>
+      sentence.trim() &&
+      !/^(você é|you are|contexto|context|não altere|do not edit|apenas|only)\b/i.test(
+        sentence.trim(),
+      ),
+  );
+  return trimActivityText(useful || normalized);
+}
+
+function formatSpawnAgentStatus(input) {
+  const intent = extractFunctionalIntent(getStringFieldFromInput(input, 'message'));
+  return intent ? `Delegating: ${intent}` : 'Delegating work';
+}
+
 function formatFunctionalCommandStatus(command) {
   const cmd = command.toLowerCase();
   if (!cmd.trim()) return 'Working in the terminal';
@@ -305,7 +341,7 @@ function formatCodexToolStatus(toolName, input) {
     return formatFunctionalCommandStatus(getCommandFromInput(input));
   }
   if (toolName.endsWith('apply_patch')) return 'Editing files';
-  if (toolName.endsWith('spawn_agent')) return 'Spawning agent';
+  if (toolName.endsWith('spawn_agent')) return formatSpawnAgentStatus(input);
   if (toolName.endsWith('wait_agent')) return 'Waiting for agent';
   if (toolName === 'web.run') return 'Searching the web';
   return `Using ${toolName}`;

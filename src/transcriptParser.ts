@@ -139,6 +139,42 @@ function getCommandFromInput(input: unknown): string {
   return '';
 }
 
+function getStringFieldFromInput(input: unknown, field: string): string {
+  const normalized = normalizeToolInput(input);
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) return '';
+  const value = (normalized as Record<string, unknown>)[field];
+  return typeof value === 'string' ? value : '';
+}
+
+function trimActivityText(text: string, maxLength = 90): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1).trim()}…`;
+}
+
+function extractFunctionalIntent(message: string): string {
+  const normalized = message.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  const objectiveMatch = normalized.match(
+    /(?:objetivo|objective|task|tarefa)\s*:\s*(.+?)(?:\s+(?:faça|entregue|não|do not|return|requirements?)\b|$)/i,
+  );
+  if (objectiveMatch?.[1]) return trimActivityText(objectiveMatch[1]);
+  const sentences = normalized.split(/(?<=[.!?])\s+/);
+  const useful = sentences.find((sentence) => {
+    const trimmed = sentence.trim();
+    return (
+      trimmed &&
+      !/^(você é|you are|contexto|context|não altere|do not edit|apenas|only)\b/i.test(trimmed)
+    );
+  });
+  return trimActivityText(useful || normalized);
+}
+
+function formatSpawnAgentStatus(input: unknown): string {
+  const intent = extractFunctionalIntent(getStringFieldFromInput(input, 'message'));
+  return intent ? `Delegating: ${intent}` : 'Delegating work';
+}
+
 export function processTranscriptLine(
   agentId: number,
   line: string,
@@ -495,7 +531,7 @@ function formatCodexToolStatus(toolName: string, input?: unknown): string {
     return formatFunctionalCommandStatus(getCommandFromInput(input));
   }
   if (toolName.endsWith('apply_patch')) return 'Editing files';
-  if (toolName.endsWith('spawn_agent')) return 'Spawning agent';
+  if (toolName.endsWith('spawn_agent')) return formatSpawnAgentStatus(input);
   if (toolName.endsWith('wait_agent')) return 'Waiting for agent';
   if (toolName === 'web.run') return 'Searching the web';
   return `Using ${toolName}`;
