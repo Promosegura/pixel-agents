@@ -20,7 +20,6 @@ const pollIntervalMs = Number(process.env.PIXEL_AGENTS_STANDALONE_POLL_MS ?? '75
 const maxMessageBodySize = 64 * 1024;
 const maxHookBodySize = 64 * 1024;
 const maxFirstLineBytes = 1024 * 1024;
-const maxStatusArgChars = 500;
 const allowedHosts = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
 const pixelAgentsDir = path.join(os.homedir(), '.pixel-agents');
 const discoveryFile = path.join(pixelAgentsDir, 'standalone-codex-server.json');
@@ -248,24 +247,62 @@ function addHookAgent(event) {
   });
 }
 
-function safeStatusArgs(input) {
-  if (typeof input === 'string') return input.slice(0, maxStatusArgChars);
-  if (!input || typeof input !== 'object') return '';
-  try {
-    const shallow = Array.isArray(input)
-      ? input.slice(0, 10)
-      : Object.fromEntries(Object.entries(input).slice(0, 10));
-    return JSON.stringify(shallow).slice(0, maxStatusArgChars);
-  } catch {
-    return '';
+function normalizeToolInput(input) {
+  if (typeof input === 'string') {
+    try {
+      return JSON.parse(input);
+    } catch {
+      return input;
+    }
   }
+  return input;
+}
+
+function getCommandFromInput(input) {
+  const normalized = normalizeToolInput(input);
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) return '';
+  return typeof normalized.cmd === 'string'
+    ? normalized.cmd
+    : typeof normalized.command === 'string'
+      ? normalized.command
+      : '';
+}
+
+function formatFunctionalCommandStatus(command) {
+  const cmd = command.toLowerCase();
+  if (!cmd.trim()) return 'Working in the terminal';
+  if (
+    /\bnpm\s+run\s+(test|test:webview|test:server|e2e)\b/.test(cmd) ||
+    /\b(vitest|playwright test)\b/.test(cmd)
+  ) {
+    return 'Running quality smoke tests';
+  }
+  if (
+    /\bnpm\s+run\s+(check-types|lint|format:check|knip)\b/.test(cmd) ||
+    /\b(tsc|eslint|prettier --check|knip)\b/.test(cmd)
+  ) {
+    return 'Validating code quality';
+  }
+  if (
+    /\bnpm\s+run\s+(build|compile|package|build:webview)\b/.test(cmd) ||
+    /\b(vite build|esbuild)\b/.test(cmd)
+  ) {
+    return 'Building the application';
+  }
+  if (/\bnpm\s+(install|ci)\b/.test(cmd)) return 'Installing project dependencies';
+  if (/\bgit\s+(status|diff|log|show|branch)\b/.test(cmd)) return 'Reviewing repository changes';
+  if (/\bgit\s+(add|commit|push|pull|fetch)\b/.test(cmd)) return 'Updating version control';
+  if (/\b(rg|grep|find|ls|sed|nl|cat)\b/.test(cmd)) return 'Inspecting project files';
+  if (/\b(curl|wget)\b/.test(cmd)) return 'Checking a local service endpoint';
+  if (/\b(lsof|ps|kill)\b/.test(cmd)) return 'Managing the local preview service';
+  if (/\bnode\s+scripts\/standalone-codex-server\.mjs\b/.test(cmd))
+    return 'Starting the browser preview';
+  return 'Working in the terminal';
 }
 
 function formatCodexToolStatus(toolName, input) {
-  const args = safeStatusArgs(input);
-  const trimmedArgs = args.length > 90 ? `${args.slice(0, 90)}...` : args;
   if (toolName.endsWith('exec_command')) {
-    return trimmedArgs ? `Running: ${trimmedArgs}` : 'Running command';
+    return formatFunctionalCommandStatus(getCommandFromInput(input));
   }
   if (toolName.endsWith('apply_patch')) return 'Editing files';
   if (toolName.endsWith('spawn_agent')) return 'Spawning agent';

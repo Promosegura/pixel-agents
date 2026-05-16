@@ -2,10 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-import {
-  BASH_COMMAND_DISPLAY_MAX_LENGTH,
-  TASK_DESCRIPTION_DISPLAY_MAX_LENGTH,
-} from '../../../constants.js';
+import { TASK_DESCRIPTION_DISPLAY_MAX_LENGTH } from '../../../constants.js';
 import type { AgentEvent, HookProvider } from '../../../provider.js';
 import {
   areHooksInstalled as installerAreHooksInstalled,
@@ -15,6 +12,39 @@ import {
 import { claudeTeamProvider } from './claudeTeamProvider.js';
 
 // ── formatToolStatus: moved from src/transcriptParser.ts ──
+
+function formatFunctionalCommandStatus(command: string): string {
+  const cmd = command.toLowerCase();
+  if (!cmd.trim()) return 'Working in the terminal';
+  if (
+    /\bnpm\s+run\s+(test|test:webview|test:server|e2e)\b/.test(cmd) ||
+    /\b(vitest|playwright test)\b/.test(cmd)
+  ) {
+    return 'Running quality smoke tests';
+  }
+  if (
+    /\bnpm\s+run\s+(check-types|lint|format:check|knip)\b/.test(cmd) ||
+    /\b(tsc|eslint|prettier --check|knip)\b/.test(cmd)
+  ) {
+    return 'Validating code quality';
+  }
+  if (
+    /\bnpm\s+run\s+(build|compile|package|build:webview)\b/.test(cmd) ||
+    /\b(vite build|esbuild)\b/.test(cmd)
+  ) {
+    return 'Building the application';
+  }
+  if (/\bnpm\s+(install|ci)\b/.test(cmd)) return 'Installing project dependencies';
+  if (/\bgit\s+(status|diff|log|show|branch)\b/.test(cmd)) return 'Reviewing repository changes';
+  if (/\bgit\s+(add|commit|push|pull|fetch)\b/.test(cmd)) return 'Updating version control';
+  if (/\b(rg|grep|find|ls|sed|nl|cat)\b/.test(cmd)) return 'Inspecting project files';
+  if (/\b(curl|wget)\b/.test(cmd)) return 'Checking a local service endpoint';
+  if (/\b(lsof|ps|kill)\b/.test(cmd)) return 'Managing the local preview service';
+  if (/\bnode\s+scripts\/standalone-codex-server\.mjs\b/.test(cmd)) {
+    return 'Starting the browser preview';
+  }
+  return 'Working in the terminal';
+}
 
 export function formatToolStatus(toolName: string, input?: unknown): string {
   const inp = (input ?? {}) as Record<string, unknown>;
@@ -28,7 +58,7 @@ export function formatToolStatus(toolName: string, input?: unknown): string {
       return `Writing ${base(inp.file_path)}`;
     case 'Bash': {
       const cmd = (inp.command as string) || '';
-      return `Running: ${cmd.length > BASH_COMMAND_DISPLAY_MAX_LENGTH ? cmd.slice(0, BASH_COMMAND_DISPLAY_MAX_LENGTH) + '\u2026' : cmd}`;
+      return formatFunctionalCommandStatus(cmd);
     }
     case 'Glob':
       return 'Searching files';

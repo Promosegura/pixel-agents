@@ -86,6 +86,59 @@ function defaultFormatToolStatus(toolName: string, input: Record<string, unknown
   }
 }
 
+function formatFunctionalCommandStatus(command: string): string {
+  const cmd = command.toLowerCase();
+  if (!cmd.trim()) return 'Working in the terminal';
+  if (
+    /\bnpm\s+run\s+(test|test:webview|test:server|e2e)\b/.test(cmd) ||
+    /\b(vitest|playwright test)\b/.test(cmd)
+  ) {
+    return 'Running quality smoke tests';
+  }
+  if (
+    /\bnpm\s+run\s+(check-types|lint|format:check|knip)\b/.test(cmd) ||
+    /\b(tsc|eslint|prettier --check|knip)\b/.test(cmd)
+  ) {
+    return 'Validating code quality';
+  }
+  if (
+    /\bnpm\s+run\s+(build|compile|package|build:webview)\b/.test(cmd) ||
+    /\b(vite build|esbuild)\b/.test(cmd)
+  ) {
+    return 'Building the application';
+  }
+  if (/\bnpm\s+(install|ci)\b/.test(cmd)) return 'Installing project dependencies';
+  if (/\bgit\s+(status|diff|log|show|branch)\b/.test(cmd)) return 'Reviewing repository changes';
+  if (/\bgit\s+(add|commit|push|pull|fetch)\b/.test(cmd)) return 'Updating version control';
+  if (/\b(rg|grep|find|ls|sed|nl|cat)\b/.test(cmd)) return 'Inspecting project files';
+  if (/\b(curl|wget)\b/.test(cmd)) return 'Checking a local service endpoint';
+  if (/\b(lsof|ps|kill)\b/.test(cmd)) return 'Managing the local preview service';
+  if (/\bnode\s+scripts\/standalone-codex-server\.mjs\b/.test(cmd)) {
+    return 'Starting the browser preview';
+  }
+  return 'Working in the terminal';
+}
+
+function normalizeToolInput(input: unknown): unknown {
+  if (typeof input === 'string') {
+    try {
+      return JSON.parse(input) as unknown;
+    } catch {
+      return input;
+    }
+  }
+  return input;
+}
+
+function getCommandFromInput(input: unknown): string {
+  const normalized = normalizeToolInput(input);
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) return '';
+  const record = normalized as Record<string, unknown>;
+  if (typeof record.cmd === 'string') return record.cmd;
+  if (typeof record.command === 'string') return record.command;
+  return '';
+}
+
 export function processTranscriptLine(
   agentId: number,
   line: string,
@@ -438,18 +491,8 @@ export function processTranscriptLine(
 }
 
 function formatCodexToolStatus(toolName: string, input?: unknown): string {
-  const args =
-    typeof input === 'string'
-      ? input
-      : typeof input === 'object' && input !== null
-        ? JSON.stringify(input)
-        : '';
-  const trimmedArgs =
-    args.length > BASH_COMMAND_DISPLAY_MAX_LENGTH
-      ? `${args.slice(0, BASH_COMMAND_DISPLAY_MAX_LENGTH)}\u2026`
-      : args;
   if (toolName.endsWith('exec_command')) {
-    return trimmedArgs ? `Running: ${trimmedArgs}` : 'Running command';
+    return formatFunctionalCommandStatus(getCommandFromInput(input));
   }
   if (toolName.endsWith('apply_patch')) return 'Editing files';
   if (toolName.endsWith('spawn_agent')) return 'Spawning agent';
