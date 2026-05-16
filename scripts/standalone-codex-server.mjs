@@ -377,7 +377,7 @@ function scheduleWaiting(agent) {
     const closeTimer = setTimeout(() => {
       idleCloseTimersByAgent.delete(agent.id);
       if (agentsBySessionId.has(agent.sessionId) && agent.activeToolIds.size === 0) {
-        closeAgent(agent);
+        closeAgent(agent, { suppressRediscovery: false });
       }
     }, 4000);
     idleCloseTimersByAgent.set(agent.id, closeTimer);
@@ -385,12 +385,12 @@ function scheduleWaiting(agent) {
   waitingTimersByAgent.set(agent.id, timer);
 }
 
-function closeAgent(agent) {
+function closeAgent(agent, { suppressRediscovery = true } = {}) {
   clearWaitingTimer(agent);
   clearIdleCloseTimer(agent);
   clearAgentTools(agent);
   if (agent.file) {
-    closedFiles.add(agent.file);
+    if (suppressRediscovery) closedFiles.add(agent.file);
     agentsByFile.delete(agent.file);
   }
   agentsBySessionId.delete(agent.sessionId);
