@@ -33,7 +33,7 @@ export interface AgentState {
   /** True when agent has no transcript file (provider doesn't use JSONL). All state from hooks. */
   hooksOnly?: boolean;
   /** Provider that created this agent (defaults to 'claude') */
-  providerId?: string;
+  providerId?: 'claude' | 'codex';
   /** Set when SessionEnd(reason=clear) fires; cleared when SessionStart(source=clear) reassigns */
   pendingClear?: boolean;
   /** Hook-generated tool ID for PreToolUse/PostToolUse correlation */
@@ -68,6 +68,7 @@ export interface PersistedAgent {
   isExternal?: boolean;
   jsonlFile: string;
   projectDir: string;
+  providerId?: 'claude' | 'codex';
   /** Workspace folder name (only set for multi-root workspaces) */
   folderName?: string;
 

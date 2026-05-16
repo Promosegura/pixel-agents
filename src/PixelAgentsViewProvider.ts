@@ -352,10 +352,11 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
           this.persistAgents,
           message.folderPath as string | undefined,
           message.bypassPermissions as boolean | undefined,
+          (message.providerId as 'claude' | 'codex' | undefined) ?? 'claude',
         );
         // Register newly created agent(s) with hook handler
         for (const [id, agent] of this.agents) {
-          if (!prevAgentIds.has(id)) {
+          if (!prevAgentIds.has(id) && agent.providerId !== 'codex') {
             this.registerAgentHook(agent);
           }
         }
@@ -483,7 +484,9 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         );
         // Register all restored agents with hook handler
         for (const agent of this.agents.values()) {
-          this.registerAgentHook(agent);
+          if (agent.providerId !== 'codex') {
+            this.registerAgentHook(agent);
+          }
         }
         // Send persisted settings to webview
         const soundEnabled = this.context.globalState.get<boolean>(GLOBAL_KEY_SOUND_ENABLED, true);

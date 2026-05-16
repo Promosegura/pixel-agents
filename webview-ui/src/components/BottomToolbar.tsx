@@ -26,6 +26,7 @@ export function BottomToolbar({
   const [isBypassMenuOpen, setIsBypassMenuOpen] = useState(false);
   const folderPickerRef = useRef<HTMLDivElement>(null);
   const pendingBypassRef = useRef(false);
+  const pendingProviderRef = useRef<'claude' | 'codex'>('codex');
   // Close folder picker / bypass menu on outside click
   useEffect(() => {
     if (!isFolderPickerOpen && !isBypassMenuOpen) return;
@@ -44,10 +45,11 @@ export function BottomToolbar({
   const handleAgentClick = () => {
     setIsBypassMenuOpen(false);
     pendingBypassRef.current = false;
+    pendingProviderRef.current = 'codex';
     if (hasMultipleFolders) {
       setIsFolderPickerOpen((v) => !v);
     } else {
-      onOpenClaude();
+      vscode.postMessage({ type: 'openClaude', providerId: 'codex' });
     }
   };
 
@@ -66,17 +68,25 @@ export function BottomToolbar({
   const handleFolderSelect = (folder: WorkspaceFolder) => {
     setIsFolderPickerOpen(false);
     const bypassPermissions = pendingBypassRef.current;
+    const providerId = pendingProviderRef.current;
     pendingBypassRef.current = false;
-    vscode.postMessage({ type: 'openClaude', folderPath: folder.path, bypassPermissions });
+    pendingProviderRef.current = 'codex';
+    vscode.postMessage({
+      type: 'openClaude',
+      folderPath: folder.path,
+      bypassPermissions,
+      providerId,
+    });
   };
 
-  const handleBypassSelect = (bypassPermissions: boolean) => {
+  const handleProviderSelect = (providerId: 'claude' | 'codex', bypassPermissions = false) => {
     setIsBypassMenuOpen(false);
     if (hasMultipleFolders) {
+      pendingProviderRef.current = providerId;
       pendingBypassRef.current = bypassPermissions;
       setIsFolderPickerOpen(true);
     } else {
-      vscode.postMessage({ type: 'openClaude', bypassPermissions });
+      vscode.postMessage({ type: 'openClaude', bypassPermissions, providerId });
     }
   };
 
@@ -97,11 +107,13 @@ export function BottomToolbar({
               : 'bg-accent hover:bg-accent-bright'
           }
         >
-          + Agent
+          + Codex
         </Button>
         <Dropdown isOpen={isBypassMenuOpen}>
-          <DropdownItem onClick={() => handleBypassSelect(true)}>
-            Skip permissions mode <span className="text-2xs text-warning">⚠</span>
+          <DropdownItem onClick={() => handleProviderSelect('codex')}>Open Codex</DropdownItem>
+          <DropdownItem onClick={() => onOpenClaude()}>Open Claude Code</DropdownItem>
+          <DropdownItem onClick={() => handleProviderSelect('claude', true)}>
+            Open Claude Code skip permissions <span className="text-2xs text-warning">⚠</span>
           </DropdownItem>
         </Dropdown>
         <Dropdown isOpen={isFolderPickerOpen} className="min-w-128">

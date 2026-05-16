@@ -5,6 +5,7 @@ import * as vscode from 'vscode';
 
 import { JSONL_POLL_INTERVAL_MS } from '../server/src/constants.js';
 import {
+  CODEX_TERMINAL_NAME_PREFIX,
   TERMINAL_NAME_PREFIX,
   WORKSPACE_KEY_AGENT_SEATS,
   WORKSPACE_KEY_AGENTS,
@@ -18,6 +19,8 @@ import {
 import { migrateAndLoadLayout } from './layoutPersistence.js';
 import { cancelPermissionTimer, cancelWaitingTimer } from './timerManager.js';
 import type { AgentState, PersistedAgent } from './types.js';
+
+type AgentProviderId = 'claude' | 'codex';
 
 export function getProjectDirPath(cwd?: string): string {
   // Fall back to home directory when no workspace folder is open.
@@ -60,6 +63,69 @@ export function getProjectDirPath(cwd?: string): string {
   return projectDir;
 }
 
+function getCodexSessionDirs(): string[] {
+  const dirs: string[] = [];
+  const root = path.join(os.homedir(), '.codex', 'sessions');
+  const now = new Date();
+  for (let i = 0; i < 3; i++) {
+    const d = new Date(now);
+    d.setDate(now.getDate() - i);
+    const year = String(d.getFullYear());
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    dirs.push(path.join(root, year, month, day));
+  }
+  return dirs;
+}
+
+function readCodexSessionCwd(filePath: string): string | undefined {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(16_384);
+    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    const firstLine = buf.toString('utf8', 0, bytesRead).split('\n')[0];
+    if (!firstLine.trim()) return undefined;
+    const record = JSON.parse(firstLine) as {
+      type?: string;
+      payload?: { cwd?: string; session_meta?: { cwd?: string } };
+    };
+    return record.payload?.cwd ?? record.payload?.session_meta?.cwd;
+  } catch {
+    return undefined;
+  }
+}
+
+function findCodexSessionFile(
+  cwd: string,
+  createdAt: number,
+  knownJsonlFiles: Set<string>,
+  agents: Map<number, AgentState>,
+): string | null {
+  const trackedFiles = new Set([...agents.values()].map((a) => path.resolve(a.jsonlFile)));
+  const candidates: Array<{ file: string; mtime: number }> = [];
+  for (const dir of getCodexSessionDirs()) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      for (const entry of fs.readdirSync(dir)) {
+        if (!entry.endsWith('.jsonl')) continue;
+        const file = path.join(dir, entry);
+        const resolved = path.resolve(file);
+        if (knownJsonlFiles.has(file) || trackedFiles.has(resolved)) continue;
+        const stat = fs.statSync(file);
+        if (stat.mtimeMs < createdAt - 1000) continue;
+        const sessionCwd = readCodexSessionCwd(file);
+        if (sessionCwd && path.resolve(sessionCwd) !== path.resolve(cwd)) continue;
+        candidates.push({ file, mtime: stat.mtimeMs });
+      }
+    } catch {
+      /* ignore unreadable session dirs */
+    }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  return candidates[0]?.file ?? null;
+}
+
 export async function launchNewTerminal(
   nextAgentIdRef: { current: number },
   nextTerminalIndexRef: { current: number },
@@ -76,6 +142,7 @@ export async function launchNewTerminal(
   persistAgents: () => void,
   folderPath?: string,
   bypassPermissions?: boolean,
+  providerId: AgentProviderId = 'claude',
 ): Promise<void> {
   const folders = vscode.workspace.workspaceFolders;
   // Use home directory as fallback cwd when no workspace is open (common on Linux/macOS).
@@ -84,23 +151,34 @@ export async function launchNewTerminal(
   const cwd = folderPath || folders?.[0]?.uri.fsPath || os.homedir();
   const isMultiRoot = !!(folders && folders.length > 1);
   const idx = nextTerminalIndexRef.current++;
+  const terminalPrefix = providerId === 'codex' ? CODEX_TERMINAL_NAME_PREFIX : TERMINAL_NAME_PREFIX;
   const terminal = vscode.window.createTerminal({
-    name: `${TERMINAL_NAME_PREFIX} #${idx}`,
+    name: `${terminalPrefix} #${idx}`,
     cwd,
   });
   terminal.show();
 
   const sessionId = crypto.randomUUID();
-  const claudeCmd = bypassPermissions
-    ? `claude --session-id ${sessionId} --dangerously-skip-permissions`
-    : `claude --session-id ${sessionId}`;
-  terminal.sendText(claudeCmd);
+  if (providerId === 'codex') {
+    terminal.sendText('codex');
+  } else {
+    const claudeCmd = bypassPermissions
+      ? `claude --session-id ${sessionId} --dangerously-skip-permissions`
+      : `claude --session-id ${sessionId}`;
+    terminal.sendText(claudeCmd);
+  }
 
-  const projectDir = getProjectDirPath(cwd);
+  const codexSessionDirs = getCodexSessionDirs();
+  const projectDir = providerId === 'codex' ? codexSessionDirs[0] : getProjectDirPath(cwd);
 
   // Pre-register expected JSONL file so project scan won't treat it as a /clear file
-  const expectedFile = path.join(projectDir, `${sessionId}.jsonl`);
-  knownJsonlFiles.add(expectedFile);
+  const expectedFile =
+    providerId === 'codex'
+      ? path.join(projectDir, `pending-${sessionId}.jsonl`)
+      : path.join(projectDir, `${sessionId}.jsonl`);
+  if (providerId === 'claude') {
+    knownJsonlFiles.add(expectedFile);
+  }
 
   // Create agent immediately (before JSONL file exists)
   const id = nextAgentIdRef.current++;
@@ -128,6 +206,7 @@ export async function launchNewTerminal(
     seenUnknownRecordTypes: new Set(),
     folderName,
     hookDelivered: false,
+    providerId,
     inputTokens: 0,
     outputTokens: 0,
   };
@@ -138,20 +217,22 @@ export async function launchNewTerminal(
   console.log(`[Pixel Agents] Terminal: Agent ${id} - created for terminal ${terminal.name}`);
   webview?.postMessage({ type: 'agentCreated', id, folderName });
 
-  ensureProjectScan(
-    projectDir,
-    knownJsonlFiles,
-    projectScanTimerRef,
-    activeAgentIdRef,
-    nextAgentIdRef,
-    agents,
-    fileWatchers,
-    pollingTimers,
-    waitingTimers,
-    permissionTimers,
-    webview,
-    persistAgents,
-  );
+  if (providerId === 'claude') {
+    ensureProjectScan(
+      projectDir,
+      knownJsonlFiles,
+      projectScanTimerRef,
+      activeAgentIdRef,
+      nextAgentIdRef,
+      agents,
+      fileWatchers,
+      pollingTimers,
+      waitingTimers,
+      permissionTimers,
+      webview,
+      persistAgents,
+    );
+  }
 
   // Poll for the specific JSONL file to appear
   const createdAt = Date.now();
@@ -160,7 +241,28 @@ export async function launchNewTerminal(
   const pollTimer = setInterval(() => {
     pollCount++;
     try {
-      if (fs.existsSync(agent.jsonlFile)) {
+      if (providerId === 'codex') {
+        const codexFile = findCodexSessionFile(cwd, createdAt, knownJsonlFiles, agents);
+        if (codexFile) {
+          console.log(
+            `[Pixel Agents] Terminal: Codex agent ${id} - found JSONL file ${path.basename(codexFile)} (after ${pollCount}s)`,
+          );
+          clearInterval(pollTimer);
+          jsonlPollTimers.delete(id);
+          knownJsonlFiles.add(codexFile);
+          reassignAgentToFile(
+            id,
+            codexFile,
+            agents,
+            fileWatchers,
+            pollingTimers,
+            waitingTimers,
+            permissionTimers,
+            webview,
+            persistAgents,
+          );
+        }
+      } else if (fs.existsSync(agent.jsonlFile)) {
         console.log(
           `[Pixel Agents] Terminal: Agent ${id} - found JSONL file ${path.basename(agent.jsonlFile)} (after ${pollCount}s)`,
         );
@@ -198,7 +300,7 @@ export async function launchNewTerminal(
           `[Pixel Agents] Terminal: Agent ${id} - JSONL file not found after 10s. ` +
             `Expected: ${agent.jsonlFile}. ${dirContents}`,
         );
-      } else if (pollCount > 10) {
+      } else if (providerId === 'claude' && pollCount > 10) {
         // Possible /resume: terminal started a different session than expected.
         // Check every tick for a file modified after the agent was created.
         try {
@@ -293,6 +395,7 @@ export function persistAgents(
       isExternal: agent.isExternal || undefined,
       jsonlFile: agent.jsonlFile,
       projectDir: agent.projectDir,
+      providerId: agent.providerId,
       folderName: agent.folderName,
       teamName: agent.teamName,
       agentName: agent.agentName,
@@ -375,6 +478,7 @@ export function restoreAgents(
       seenUnknownRecordTypes: new Set(),
       folderName: p.folderName,
       hookDelivered: false,
+      providerId: p.providerId ?? 'claude',
       inputTokens: 0,
       outputTokens: 0,
       teamName: p.teamName,
