@@ -105,7 +105,7 @@ Characters are based on the amazing work of [JIK-A-4, Metro City](https://jik-a-
 
 ## How It Works
 
-Pixel Agents watches each supported CLI's JSONL transcript files to track what each agent is doing. Claude Code sessions are read from `~/.claude/projects/`; Codex sessions are read from `~/.codex/sessions/`. When an agent uses a tool (like writing a file or running a command), the extension detects it and updates the character's animation accordingly. No modifications to Claude Code or Codex are needed — it's purely observational.
+Pixel Agents watches each supported CLI's JSONL transcript files to track what each agent is doing. Claude Code sessions are read from `~/.claude/projects/`; Codex sessions are read from `~/.codex/sessions/`. In standalone Codex mode, optional lifecycle hooks provide the primary live signal and transcript polling remains the fallback. When an agent uses a tool (like writing a file or running a command), Pixel Agents detects it and updates the character's animation.
 
 See [CODEX.md](CODEX.md) for Codex-specific behavior and current limitations.
 
@@ -118,6 +118,18 @@ npm run standalone
 ```
 
 Open the printed local URL in a browser. This mode serves the same Pixel Agents UI and watches recent Codex transcripts in `~/.codex/sessions`.
+
+For live Codex lifecycle hooks in standalone mode, run:
+
+```bash
+npm run codex:hooks:install
+```
+
+This safely adds Pixel Agents entries to `~/.codex/hooks.json`, preserves hooks from other tools, and backs up the previous file to `~/.codex/hooks.json.pixel-agents-bak`. Remove the Pixel Agents entries with:
+
+```bash
+npm run codex:hooks:uninstall
+```
 
 The webview runs a lightweight game loop with canvas rendering, BFS pathfinding, and a character state machine (idle → walk → type/read). Everything is pixel-perfect at integer zoom levels.
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,15 +18,23 @@ const requestedPort = parseRequestedPort(portArg);
 const scanWindowMinutes = Number(process.env.PIXEL_AGENTS_STANDALONE_WINDOW_MINUTES ?? '720');
 const pollIntervalMs = Number(process.env.PIXEL_AGENTS_STANDALONE_POLL_MS ?? '750');
 const maxMessageBodySize = 64 * 1024;
+const maxHookBodySize = 64 * 1024;
 const maxFirstLineBytes = 1024 * 1024;
 const maxStatusArgChars = 500;
 const allowedHosts = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+const pixelAgentsDir = path.join(os.homedir(), '.pixel-agents');
+const discoveryFile = path.join(pixelAgentsDir, 'standalone-codex-server.json');
 
 const clients = new Set();
 const agentsByFile = new Map();
+const agentsBySessionId = new Map();
 const closedFiles = new Set();
+const recentHookEvents = new Map();
 const waitingTimersByAgent = new Map();
 let nextAgentId = 1;
+const hookToken =
+  process.env.PIXEL_AGENTS_STANDALONE_HOOK_TOKEN || crypto.randomBytes(32).toString('hex');
+const dedupeTtlMs = 5 * 60_000;
 
 function parseRequestedPort(arg) {
   if (!arg) return 0;
@@ -66,6 +75,25 @@ function validateHost(req, res) {
     ? hostHeader.slice(0, hostHeader.indexOf(']') + 1)
     : hostHeader.split(':')[0];
   if (allowedHosts.has(host)) return true;
+  res.writeHead(403);
+  res.end('forbidden');
+  return false;
+}
+
+function validateOrigin(req, res) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    if (
+      parsed.protocol === 'http:' &&
+      (allowedHosts.has(parsed.hostname) || allowedHosts.has(`[${parsed.hostname}]`))
+    ) {
+      return true;
+    }
+  } catch {
+    // Reject malformed origins below.
+  }
   res.writeHead(403);
   res.end('forbidden');
   return false;
@@ -154,6 +182,19 @@ function shortFolderName(sessionCwd) {
 }
 
 function addAgent(file, stat, meta, replay = false) {
+  const sessionId = typeof meta.id === 'string' ? meta.id : path.basename(file, '.jsonl');
+  const existingBySession = agentsBySessionId.get(sessionId);
+  if (existingBySession) {
+    if (!existingBySession.file || existingBySession.file.startsWith('hook:')) {
+      existingBySession.file = file;
+      existingBySession.offset = replay ? 0 : stat.size;
+      existingBySession.lineBuffer = '';
+      existingBySession.decoder = new StringDecoder('utf8');
+      agentsByFile.set(file, existingBySession);
+      closedFiles.delete(file);
+    }
+    return existingBySession;
+  }
   if (agentsByFile.has(file)) return agentsByFile.get(file);
   if (closedFiles.has(file)) return null;
   const id = nextAgentId++;
@@ -161,7 +202,7 @@ function addAgent(file, stat, meta, replay = false) {
     id,
     file,
     cwd: typeof meta.cwd === 'string' ? meta.cwd : undefined,
-    sessionId: meta.id ?? path.basename(file, '.jsonl'),
+    sessionId,
     offset: replay ? 0 : stat.size,
     lineBuffer: '',
     decoder: new StringDecoder('utf8'),
@@ -169,10 +210,38 @@ function addAgent(file, stat, meta, replay = false) {
     activeToolNames: new Map(),
     inputTokens: 0,
     outputTokens: 0,
+    hookDelivered: false,
   };
   agentsByFile.set(file, agent);
+  agentsBySessionId.set(agent.sessionId, agent);
   broadcast({ type: 'agentCreated', id, folderName: shortFolderName(meta.cwd) });
   return agent;
+}
+
+function addHookAgent(event) {
+  const sessionId = getHookSessionId(event);
+  if (!sessionId) return null;
+  const existing = agentsBySessionId.get(sessionId);
+  if (existing) {
+    existing.hookDelivered = true;
+    if (!existing.cwd && typeof event.cwd === 'string') {
+      existing.cwd = event.cwd;
+    }
+    return existing;
+  }
+  const transcriptPath =
+    typeof event.transcript_path === 'string'
+      ? event.transcript_path
+      : typeof event.transcriptPath === 'string'
+        ? event.transcriptPath
+        : undefined;
+  const file = transcriptPath || `hook:${sessionId}`;
+  const stat =
+    transcriptPath && fs.existsSync(transcriptPath) ? fs.statSync(transcriptPath) : { size: 0 };
+  return addAgent(file, stat, {
+    id: sessionId,
+    cwd: typeof event.cwd === 'string' ? event.cwd : cwd,
+  });
 }
 
 function safeStatusArgs(input) {
@@ -219,7 +288,7 @@ function scheduleWaiting(agent) {
   clearWaitingTimer(agent);
   const timer = setTimeout(() => {
     waitingTimersByAgent.delete(agent.id);
-    if (!agentsByFile.has(agent.file)) return;
+    if (!agentsBySessionId.has(agent.sessionId)) return;
     broadcast({ type: 'agentStatus', id: agent.id, status: 'waiting' });
   }, 1500);
   waitingTimersByAgent.set(agent.id, timer);
@@ -228,8 +297,11 @@ function scheduleWaiting(agent) {
 function closeAgent(agent) {
   clearWaitingTimer(agent);
   clearAgentTools(agent);
-  closedFiles.add(agent.file);
-  agentsByFile.delete(agent.file);
+  if (agent.file) {
+    closedFiles.add(agent.file);
+    agentsByFile.delete(agent.file);
+  }
+  agentsBySessionId.delete(agent.sessionId);
   broadcast({ type: 'agentClosed', id: agent.id });
 }
 
@@ -299,6 +371,7 @@ function processCodexRecord(agent, record) {
 }
 
 function readNewLines(agent) {
+  if (!agent.file || agent.file.startsWith('hook:')) return;
   try {
     const stat = fs.statSync(agent.file);
     if (stat.size <= agent.offset) return;
@@ -328,6 +401,151 @@ function readNewLines(agent) {
   }
 }
 
+function getHookSessionId(event) {
+  for (const key of ['session_id', 'sessionId', 'conversation_id', 'conversationId']) {
+    if (typeof event[key] === 'string' && event[key].trim()) return event[key];
+  }
+  return undefined;
+}
+
+function getHookEventName(event) {
+  for (const key of ['hook_event_name', 'hookEventName', 'event', 'type']) {
+    if (typeof event[key] === 'string' && event[key].trim()) return event[key];
+  }
+  return undefined;
+}
+
+function getHookToolId(event) {
+  for (const key of [
+    'tool_use_id',
+    'toolUseId',
+    'tool_call_id',
+    'toolCallId',
+    'call_id',
+    'callId',
+    'id',
+  ]) {
+    if (typeof event[key] === 'string' && event[key].trim()) return event[key];
+  }
+  return `hook-${Date.now()}`;
+}
+
+function getHookToolName(event) {
+  for (const key of ['tool_name', 'toolName', 'name']) {
+    if (typeof event[key] === 'string' && event[key].trim()) return event[key];
+  }
+  if (event.tool && typeof event.tool === 'object' && typeof event.tool.name === 'string') {
+    return event.tool.name;
+  }
+  return 'tool';
+}
+
+function getHookToolInput(event) {
+  for (const key of ['tool_input', 'toolInput', 'input', 'arguments']) {
+    if (event[key] !== undefined) return event[key];
+  }
+  if (event.tool && typeof event.tool === 'object' && event.tool.input !== undefined) {
+    return event.tool.input;
+  }
+  return undefined;
+}
+
+function getHookDedupeKey(event, eventName) {
+  const sessionId = getHookSessionId(event);
+  if (!sessionId) return undefined;
+  const turnId =
+    typeof event.turn_id === 'string'
+      ? event.turn_id
+      : typeof event.turnId === 'string'
+        ? event.turnId
+        : '';
+  const toolId = getHookToolId(event);
+  const sequence =
+    typeof event.sequence_number === 'number'
+      ? String(event.sequence_number)
+      : typeof event.sequenceNumber === 'number'
+        ? String(event.sequenceNumber)
+        : '';
+  if (turnId || sequence || !toolId.startsWith('hook-')) {
+    return [sessionId, eventName, turnId, toolId, sequence].join(':');
+  }
+  return undefined;
+}
+
+function isDuplicateHookEvent(event, eventName) {
+  const now = Date.now();
+  for (const [key, timestamp] of recentHookEvents) {
+    if (now - timestamp > dedupeTtlMs) recentHookEvents.delete(key);
+  }
+  const key = getHookDedupeKey(event, eventName);
+  if (!key) return false;
+  if (recentHookEvents.has(key)) return true;
+  recentHookEvents.set(key, now);
+  return false;
+}
+
+function processCodexHookEvent(event) {
+  const eventName = getHookEventName(event);
+  if (!eventName) return { accepted: false, reason: 'missing hook event name' };
+  if (isDuplicateHookEvent(event, eventName)) return { accepted: true };
+  const agent = addHookAgent(event);
+  if (!agent) return { accepted: false, reason: 'missing session id' };
+  agent.hookDelivered = true;
+
+  if (eventName === 'SessionStart' || eventName === 'UserPromptSubmit') {
+    clearWaitingTimer(agent);
+    clearAgentTools(agent);
+    broadcast({ type: 'agentStatus', id: agent.id, status: 'active' });
+    return { accepted: true };
+  }
+
+  if (eventName === 'PreToolUse') {
+    const toolId = getHookToolId(event);
+    const toolName = getHookToolName(event);
+    const status = formatCodexToolStatus(toolName, getHookToolInput(event));
+    clearWaitingTimer(agent);
+    if (!agent.activeToolIds.has(toolId)) {
+      agent.activeToolIds.add(toolId);
+      agent.activeToolNames.set(toolId, toolName);
+      broadcast({ type: 'agentToolStart', id: agent.id, toolId, status, toolName });
+    }
+    broadcast({ type: 'agentStatus', id: agent.id, status: 'active' });
+    return { accepted: true };
+  }
+
+  if (eventName === 'PostToolUse') {
+    const toolId = getHookToolId(event);
+    const toolIds = agent.activeToolIds.has(toolId) ? [toolId] : [...agent.activeToolIds];
+    for (const id of toolIds) {
+      agent.activeToolIds.delete(id);
+      agent.activeToolNames.delete(id);
+      broadcast({ type: 'agentToolDone', id: agent.id, toolId: id });
+    }
+    if (agent.activeToolIds.size === 0) scheduleWaiting(agent);
+    return { accepted: true };
+  }
+
+  if (eventName === 'PermissionRequest') {
+    clearWaitingTimer(agent);
+    broadcast({ type: 'agentToolPermission', id: agent.id });
+    return { accepted: true };
+  }
+
+  if (eventName === 'Stop' || eventName === 'PostCompact') {
+    clearAgentTools(agent);
+    scheduleWaiting(agent);
+    return { accepted: true };
+  }
+
+  if (eventName === 'PreCompact') {
+    clearWaitingTimer(agent);
+    broadcast({ type: 'agentStatus', id: agent.id, status: 'active' });
+    return { accepted: true };
+  }
+
+  return { accepted: true };
+}
+
 function scanCodexSessions() {
   for (const { file, stat, meta } of discoverSessionFiles()) {
     addAgent(file, stat, meta);
@@ -349,7 +567,7 @@ function sendInitialState(res) {
     lastSeenVersion: 'standalone-codex',
     watchAllSessions: true,
     alwaysShowLabels: true,
-    hooksEnabled: false,
+    hooksEnabled: true,
     hooksInfoShown: true,
     externalAssetDirectories: [],
   });
@@ -367,6 +585,89 @@ function sendInitialState(res) {
         outputTokens: agent.outputTokens,
       });
     }
+  }
+}
+
+function isAuthorizedHookRequest(req) {
+  const header = req.headers.authorization;
+  const expected = `Bearer ${hookToken}`;
+  const actualBuffer = Buffer.from(typeof header === 'string' ? header : '');
+  const expectedBuffer = Buffer.from(expected);
+  return (
+    actualBuffer.length === expectedBuffer.length &&
+    crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+  );
+}
+
+function handleCodexHook(req, res) {
+  if (!validateOrigin(req, res)) return;
+  if (!isAuthorizedHookRequest(req)) {
+    json(res, 401, { ok: false, error: 'unauthorized' });
+    return;
+  }
+  let body = '';
+  let bodySize = 0;
+  let rejected = false;
+  req.on('data', (chunk) => {
+    bodySize += chunk.length;
+    if (bodySize > maxHookBodySize) {
+      rejected = true;
+      res.writeHead(413);
+      res.end('payload too large');
+      req.destroy();
+      return;
+    }
+    body += chunk.toString();
+  });
+  req.on('end', () => {
+    if (rejected) return;
+    try {
+      const event = body ? JSON.parse(body) : {};
+      const result = processCodexHookEvent(event);
+      if (!result.accepted) {
+        json(res, 400, { ok: false, error: result.reason });
+        return;
+      }
+      json(res, 200, { ok: true });
+    } catch {
+      json(res, 400, { ok: false, error: 'invalid json' });
+    }
+  });
+}
+
+function writeDiscoveryFile(port) {
+  try {
+    fs.mkdirSync(pixelAgentsDir, { recursive: true, mode: 0o700 });
+    const tmpPath = `${discoveryFile}.tmp`;
+    fs.writeFileSync(
+      tmpPath,
+      JSON.stringify(
+        {
+          provider: 'codex',
+          url: `http://127.0.0.1:${port}/api/hooks/codex`,
+          token: hookToken,
+          pid: process.pid,
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+      { encoding: 'utf8', mode: 0o600 },
+    );
+    fs.renameSync(tmpPath, discoveryFile);
+    fs.chmodSync(discoveryFile, 0o600);
+  } catch (error) {
+    console.warn(`Failed to write Codex hook discovery file: ${error.message}`);
+  }
+}
+
+function removeDiscoveryFile() {
+  try {
+    if (!fs.existsSync(discoveryFile)) return;
+    const data = JSON.parse(fs.readFileSync(discoveryFile, 'utf8'));
+    if (data.pid === process.pid) fs.unlinkSync(discoveryFile);
+  } catch {
+    // Discovery cleanup is best-effort; hooks fail closed when the token file is absent.
   }
 }
 
@@ -504,7 +805,12 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === 'POST' && url === '/api/messages') {
+    if (!validateOrigin(req, res)) return;
     handleMessage(req, res);
+    return;
+  }
+  if (req.method === 'POST' && url === '/api/hooks/codex') {
+    handleCodexHook(req, res);
     return;
   }
   if (url.startsWith('/api/')) {
@@ -522,6 +828,20 @@ const server = http.createServer((req, res) => {
 server.listen(requestedPort, '127.0.0.1', () => {
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : requestedPort;
+  writeDiscoveryFile(port);
   console.log(`Pixel Agents standalone Codex server running at http://127.0.0.1:${port}`);
-  console.log(`Watching Codex sessions in ~/.codex/sessions (last ${scanWindowMinutes} minutes).`);
+  console.log('Codex lifecycle hook endpoint enabled at /api/hooks/codex.');
+  console.log(
+    `Watching Codex sessions in ~/.codex/sessions as fallback (last ${scanWindowMinutes} minutes).`,
+  );
+});
+
+process.once('exit', removeDiscoveryFile);
+process.once('SIGINT', () => {
+  removeDiscoveryFile();
+  process.exit(130);
+});
+process.once('SIGTERM', () => {
+  removeDiscoveryFile();
+  process.exit(143);
 });

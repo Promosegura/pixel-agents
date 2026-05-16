@@ -53,6 +53,8 @@
     "build:webview": "cd webview-ui && npm run build",
     "standalone": "npm run build && node scripts/standalone-codex-server.mjs",
     "standalone:serve": "node scripts/standalone-codex-server.mjs",
+    "codex:hooks:install": "node scripts/standalone-codex-hooks.mjs install",
+    "codex:hooks:uninstall": "node scripts/standalone-codex-hooks.mjs uninstall",
     "compile": "npm run check-types && npm run lint && node esbuild.js && npm run build:webview",
     "build": "npm run compile",
     "watch": "npm-run-all -p watch:*",
