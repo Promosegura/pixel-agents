@@ -17,6 +17,7 @@ const portArg = process.argv.find((arg) => arg.startsWith('--port='));
 const requestedPort = parseRequestedPort(portArg);
 const scanWindowMinutes = Number(process.env.PIXEL_AGENTS_STANDALONE_WINDOW_MINUTES ?? '720');
 const pollIntervalMs = Number(process.env.PIXEL_AGENTS_STANDALONE_POLL_MS ?? '750');
+const idleCloseDelayMs = Number(process.env.PIXEL_AGENTS_STANDALONE_IDLE_CLOSE_MS ?? '60000');
 const maxMessageBodySize = 64 * 1024;
 const maxHookBodySize = 64 * 1024;
 const maxFirstLineBytes = 1024 * 1024;
@@ -379,7 +380,7 @@ function scheduleWaiting(agent) {
       if (agentsBySessionId.has(agent.sessionId) && agent.activeToolIds.size === 0) {
         closeAgent(agent, { suppressRediscovery: false });
       }
-    }, 4000);
+    }, idleCloseDelayMs);
     idleCloseTimersByAgent.set(agent.id, closeTimer);
   }, 1500);
   waitingTimersByAgent.set(agent.id, timer);
